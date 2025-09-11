@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Police Dashboard</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+
+    <!-- Leaflet -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 0;
+        padding: 0;
+        background: #f5f5f5;
+      }
+      header {
+        background: linear-gradient(90deg, #0ea5a3, #06b6d4);
+        color: white;
+        padding: 12px 20px;
+        font-size: 20px;
+      }
+      .container {
+        display: flex;
+        padding: 20px;
+        gap: 20px;
+      }
+      #map {
+        flex: 2;
+        height: 500px;
+        border: 1px solid #ccc;
+        border-radius: 6px;
+      }
+      .sidebar {
+        flex: 1;
+        background: #e0f7fa;
+        padding: 15px;
+        border-radius: 6px;
+        border: 1px solid #ddd;
+        overflow-y: auto;
+        max-height: 600px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 10px;
+        font-size: 14px;
+      }
+      th,
+      td {
+        border: 1px solid #ddd;
+        padding: 6px;
+        text-align: left;
+      }
+      th {
+        background: #efefef;
+      }
+    </style>
+  </head>
+  <body>
+    <header>🚓 Traffic Police Dashboard</header>
+
+    <div class="container">
+      <div id="map"></div>
+      <div class="sidebar">
+        <h3>Ambulance Requests</h3>
+        <table id="requestsTable">
+          <thead>
+            <tr>
+              <th>Patient</th>
+              <th>Hospital</th>
+              <th>Ambulance Plate</th>
+              <th>Priority</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <script type="module">
+      import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+      import {
+        getDatabase,
+        ref,
+        onValue,
+      } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
+
+      // Firebase config
+      const firebaseConfig = {
+        apiKey: "AIzaSyCVOmAoo9h2-VJ6I7OCK2Naj2fYQq_Io1s",
+        authDomain: "ambulance-tracking-syste-21793.firebaseapp.com",
+        databaseURL:
+          "https://ambulance-tracking-syste-21793-default-rtdb.asia-southeast1.firebasedatabase.app/",
+        projectId: "ambulance-tracking-syste-21793",
+        storageBucket: "ambulance-tracking-syste-21793.appspot.com",
+        messagingSenderId: "1057546446784",
+        appId: "1:1057546446784:web:549e7f233fdd29786fca25",
+      };
+      const app = initializeApp(firebaseConfig);
+      const db = getDatabase(app);
+
+      // Map setup
+      const map = L.map("map").setView([20.59, 78.96], 5);
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        attribution: "© OpenStreetMap contributors",
+      }).addTo(map);
+
+      // Global storage
+      window.ambulanceMarkers = {};
+      window.routeLines = {};
+      window.hospitalCircles = {};
+      const insideAmbulances = new Set();
+
+      const requestsTableBody = document.querySelector("#requestsTable tbody");
+
+      // Smooth marker movement
+      function smoothMove(marker, newLatLng) {
+        const current = marker.getLatLng();
+        const steps = 20;
+        let i = 0;
+        const interval = setInterval(() => {
+          if (i >= steps) {
+            clearInterval(interval);
+            return;
+          }
+          const lat = current.lat + ((newLatLng.lat - current.lat) / steps) * i;
+          const lng = current.lng + ((newLatLng.lng - current.lng) / steps) * i;
+          marker.setLatLng([lat, lng]);
+          i++;
+        }, 50);
+      }
+
+      // Draw route using OSRM
+      async function drawRoute(id, ambLat, ambLng, destLat, destLng) {
+        const url = `https://router.project-osrm.org/route/v1/driving/${ambLng},${ambLat};${destLng},${destLat}?overview=full&geometries=geojson`;
+        const resp = await fetch(url);
+        const data = await resp.json();
+        if (!data.routes || !data.routes.length) return;
+
+        const coords = data.routes[0].geometry.coordinates.map((c) => [
+          c[1],
+          c[0],
+        ]);
+        if (window.routeLines[id]) map.removeLayer(window.routeLines[id]);
+        window.routeLines[id] = L.polyline(coords, {
+          color: "blue",
+          weight: 4,
+        }).addTo(map);
+      }
+
+      // Clear visuals
+      function clearAmbulanceFromMap(id) {
+        if (window.ambulanceMarkers[id]) {
+          map.removeLayer(window.ambulanceMarkers[id]);
+          delete window.ambulanceMarkers[id];
+        }
+        if (window.hospitalCircles[id]) {
+          map.removeLayer(window.hospitalCircles[id]);
+          delete window.hospitalCircles[id];
+        }
+        if (window.routeLines[id]) {
+          map.removeLayer(window.routeLines[id]);
+          delete window.routeLines[id];
+        }
+        const row = document.getElementById(`request-row-${id}`);
+        if (row) row.remove();
+        insideAmbulances.delete(id);
+      }
+
+      // Add request row
+      function addRequestToTable(req, id) {
+        let row = document.getElementById(`request-row-${id}`);
+        if (!row) {
+          row = document.createElement("tr");
+          row.id = `request-row-${id}`;
+          requestsTableBody.appendChild(row);
+        }
+        row.innerHTML = `
+          <td>${req.patientName || "-"}</td>
+          <td>${req.hospitalId || "-"}</td>
+          <td>${req.ambulancePlate || "-"}</td>
+          <td>${req.priority || "-"}</td>
+          <td>${req.status || "-"}</td>
+        `;
+      }
+
+      // Police location + 2km zone
+      let policeLat = null,
+        policeLng = null,
+        policeCircle = null;
+      if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition((pos) => {
+          policeLat = pos.coords.latitude;
+          policeLng = pos.coords.longitude;
+
+          policeCircle = L.circle([policeLat, policeLng], {
+            radius: 2000,
+            color: "blue",
+            fillColor: "blue",
+            fillOpacity: 0.1,
+          })
+            .addTo(map)
+            .bindPopup("🚓 Police 2km Zone");
+          map.setView([policeLat, policeLng], 14);
+        });
+      }
+
+      // Listen to requests
+      const requestsRef = ref(db, "requests");
+      requestsTableBody.innerHTML = "";
+      onValue(requestsRef, (snapshot) => {
+        snapshot.forEach((child) => {
+          const req = child.val();
+          const id = child.key;
+
+          if (
+            !req.ambulanceLat ||
+            !req.ambulanceLng ||
+            !policeLat ||
+            !policeLng
+          )
+            return;
+
+          const ambLatLng = L.latLng(req.ambulanceLat, req.ambulanceLng);
+          const distance = map.distance([policeLat, policeLng], ambLatLng);
+
+          // ✅ Remove if completed OR out of 2km
+          if (req.status === "Completed" || distance > 2000) {
+            clearAmbulanceFromMap(id);
+            return;
+          }
+
+          // 🚨 Alert when ambulance newly enters 2km zone
+          if (!insideAmbulances.has(id) && distance <= 2000) {
+            insideAmbulances.add(id);
+            alert(
+              `🚨 Ambulance ${req.ambulancePlate || id} entered police 2km zone!`
+            );
+          }
+
+          if (req.status === "Accepted" || req.status === "PickedUp") {
+            addRequestToTable(req, id);
+
+            // Hospital circle
+            if (req.hospitalLat && req.hospitalLng && !window.hospitalCircles[id]) {
+              window.hospitalCircles[id] = L.circle(
+                [req.hospitalLat, req.hospitalLng],
+                { radius: 2000, color: "red", fillOpacity: 0.1 }
+              ).addTo(map);
+            }
+
+            // Ambulance marker
+            if (!window.ambulanceMarkers[id]) {
+              window.ambulanceMarkers[id] = L.marker(
+                [req.ambulanceLat, req.ambulanceLng],
+                {
+                  icon: L.icon({
+                    iconUrl:
+                      "https://cdn-icons-png.flaticon.com/512/3181/3181919.png",
+                    iconSize: [32, 32],
+                    iconAnchor: [16, 16],
+                  }),
+                }
+              )
+                .addTo(map)
+                .bindPopup(
+                  `🚑 Plate: ${req.ambulancePlate || "-"}<br>
+                   Hospital: ${req.hospitalId || "-"}<br>
+                   Status: ${req.status || "-"}`
+                );
+            } else {
+              smoothMove(window.ambulanceMarkers[id], ambLatLng);
+            }
+
+            // Draw correct route
+            if (req.status === "PickedUp" && req.hospitalLat && req.hospitalLng) {
+              drawRoute(
+                id,
+                req.ambulanceLat,
+                req.ambulanceLng,
+                req.hospitalLat,
+                req.hospitalLng
+              );
+            } else if (req.pickup?.lat && req.pickup?.lng) {
+              drawRoute(
+                id,
+                req.ambulanceLat,
+                req.ambulanceLng,
+                req.pickup.lat,
+                req.pickup.lng
+              );
+            }
+          }
+        });
+      });
+    </script>
+  </body>
+</html>
